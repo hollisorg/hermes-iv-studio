@@ -36,6 +36,12 @@ hermes: [video_generate → IV Studio on your RTX GPU, about 3 minutes]
 Everything you make is also in IV Studio's Library, where you can hunt more takes, finish at other sizes, or cut
 renders together on its timeline.
 
+## And the other way round
+
+IV Studio 1.1.4 can run its own chat on your Hermes: pick **Hermes** beside Claude Code and Codex in IV Studio's
+chat, and Hermes works inside the app with every IV Studio tool, through Hermes's ACP server (`hermes-acp`). That
+part lives in IV Studio, not in this plugin; it's here so you know both directions exist.
+
 ## Needs
 
 - Windows, Linux or a Mac with an NVIDIA GPU (16 GB or more is comfortable; IV Studio's speed presets cover smaller
