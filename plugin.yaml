@@ -1,0 +1,19 @@
+name: iv-studio
+version: "1.0.0"
+description: "Free, local video and pictures for Hermes on your own NVIDIA GPU. Makes IV Studio a video_generate and image_generate backend: MiniMax H3 with sound and speech, your IV Studio characters by name, first-frame and reference pictures, finished at up to about 2752x1536, through ComfyUI on your PC. Needs the free IV Studio app."
+author: Infinite Variance (hollisorg)
+license: MIT
+homepage: https://github.com/hollisorg/hermes-iv-studio
+manifest_version: 2
+requires_hermes: ">=0.21.5"
+tags: [video, image, local, comfyui, minimax-h3, gpu]
+provides_tools:
+  - iv_studio_status
+provides_hooks: []
+requires_env: []
+config_schema:
+  ivstudio_path:
+    type: str
+    default: ""
+    description: "Optional. The IV Studio executable (or its folder) when it isn't in the usual install place, for example a portable copy."
+    required: false
