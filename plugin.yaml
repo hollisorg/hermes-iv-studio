@@ -9,6 +9,7 @@ requires_hermes: ">=0.21.5"
 tags: [video, image, local, comfyui, minimax-h3, gpu]
 provides_tools:
   - iv_studio_status
+  - iv_studio_result
 provides_hooks: []
 requires_env: []
 config_schema:
@@ -16,4 +17,9 @@ config_schema:
     type: str
     default: ""
     description: "Optional. The IV Studio executable (or its folder) when it isn't in the usual install place, for example a portable copy."
+    required: false
+  wait_seconds:
+    type: int
+    default: 330
+    description: "How long video_generate waits for a render before handing back a job id for iv_studio_result. Keep it under Hermes's tool timeout (timeouts.tools.concurrent_batch, 420 s by default)."
     required: false

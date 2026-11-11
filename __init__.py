@@ -108,18 +108,106 @@ def _fetch_output(out: dict[str, Any], folder: Path, prefix: str) -> str:
     return url
 
 
-def _wait_job(iv: IVStudio, job_id: str, label: str) -> dict[str, Any]:
-    deadline = time.monotonic() + RENDER_DEADLINE_S
+# Hermes stops any one tool call after timeouts.tools.concurrent_batch (420 s by default), and a finished H3 video
+# takes about 3-7 minutes. So a render is a small saved state that any call can move along: video_generate waits as
+# long as it safely can, then hands back the job, and iv_studio_result picks it up again.
+WAIT_S_DEFAULT = 330
+
+
+def _wait_budget() -> float:
+    try:
+        v = float((_CTX.get_config("wait_seconds", WAIT_S_DEFAULT) if _CTX else WAIT_S_DEFAULT) or WAIT_S_DEFAULT)
+    except Exception:
+        v = WAIT_S_DEFAULT
+    return max(30.0, min(v, 3600.0))
+
+
+def _state_file(job_id: str) -> Path:
+    d = _data_dir() / "renders"
+    d.mkdir(exist_ok=True)
+    return d / (re.sub(r"[^A-Za-z0-9_-]", "_", job_id) + ".json")
+
+
+def _save_state(st: dict[str, Any]) -> None:
+    f = _state_file(st["take"])
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=1), encoding="utf-8")
+    tmp.replace(f)
+
+
+def _load_state(job_id: str) -> Optional[dict[str, Any]]:
+    f = _state_file(job_id)
+    if f.is_file():
+        return json.loads(f.read_text(encoding="utf-8"))
+    return None
+
+
+def _job_out(job: dict[str, Any], kinds: tuple) -> Optional[dict[str, Any]]:
+    outs = job.get("outputs") or []
+    return next((o for o in outs if o.get("kind") in kinds), None) or (outs[0] if outs else None)
+
+
+def _advance(iv: IVStudio, st: dict[str, Any], budget_s: float) -> dict[str, Any]:
+    """Move a render along until it's done or ``budget_s`` runs out: the take, then (when asked) its finish, then the
+    file copied into Hermes's media cache. Saves the state at every step."""
+    deadline = time.monotonic() + budget_s
     while True:
-        job = iv.call("get_job", {"jobId": job_id}, timeout=90)
-        status = job.get("status")
-        if status == "success":
-            return job
-        if status in ("error", "cancelled", "canceled", "failed"):
-            raise IVStudioError(f"{label} failed: {job.get('error') or status}")
-        if time.monotonic() > deadline:
-            raise IVStudioError(f"{label} is still {status} after {RENDER_DEADLINE_S // 60} minutes; it keeps going in IV Studio.")
+        if st.get("video"):
+            st["status"] = "done"
+            break
+        if not st.get("take_done"):
+            job = iv.call("get_job", {"jobId": st["take"]}, timeout=90)
+            status = job.get("status")
+            if status in ("error", "cancelled", "canceled", "failed"):
+                st.update(status="failed", error="The take failed in IV Studio: %s" % (job.get("error") or status))
+                break
+            if status == "success":
+                st["take_done"] = True
+                st["project"] = job.get("projectId")
+                seeds = ((job.get("plan") or {}).get("resolved") or {}).get("seeds")
+                if isinstance(seeds, list) and seeds:
+                    st["seed"] = seeds[0]
+                if not st.get("finish"):
+                    st["out"] = _job_out(job, ("preview", "candidate"))
+                _save_state(st)
+                continue
+        elif st.get("finish") and not st.get("finish_job"):
+            fin = iv.call("finish_candidate", {"jobId": st["take"], "candidate": 1, **st["finish"]}, timeout=180)
+            st["finish_job"] = fin["id"]
+            _save_state(st)
+            continue
+        elif st.get("finish_job") and not st.get("out"):
+            job = iv.call("get_job", {"jobId": st["finish_job"]}, timeout=90)
+            status = job.get("status")
+            if status in ("error", "cancelled", "canceled", "failed"):
+                st.update(status="failed", error="The finish failed in IV Studio: %s" % (job.get("error") or status))
+                break
+            if status == "success":
+                st["out"] = _job_out(job, ("final",))
+                _save_state(st)
+                continue
+        if st.get("out") and not st.get("video"):
+            path = _fetch_output(st["out"], _data_dir(), "iv-studio")
+            try:
+                from agent.video_gen_provider import save_bytes_video
+                path = str(save_bytes_video(Path(path).read_bytes(), prefix="iv-studio", extension=Path(path).suffix.lstrip(".") or "mp4"))
+            except Exception:
+                pass
+            st["video"] = path
+            st["render_seconds"] = round(time.time() - st.get("started", time.time()))
+            continue
+        if time.monotonic() >= deadline:
+            st["status"] = "rendering"
+            st["stage"] = "finishing" if st.get("take_done") else "rendering the take"
+            break
         time.sleep(POLL_S)
+    _save_state(st)
+    return st
+
+
+def _still_rendering(st: dict[str, Any]) -> str:
+    return ("Still %s in IV Studio on this PC (job %s); it keeps going on its own. "
+            "Call iv_studio_result with job_id \"%s\" to wait for it and get the video." % (st.get("stage", "rendering"), st["take"], st["take"]))
 
 
 def _pick_character(prompt: str, characters: List[dict[str, Any]], asked: Optional[str]) -> Optional[dict[str, Any]]:
@@ -283,41 +371,23 @@ def _video_provider_class():
                         if "prompt checker" not in str(e):
                             raise
                         job = iv.call("generate_previews", {**ask, "force": True}, timeout=180)
-                    job = _wait_job(iv, job["id"], "The take")
-                    out = next((o for o in job.get("outputs", []) if o.get("kind") in ("preview", "candidate")), None) or (job.get("outputs") or [None])[0]
-                    final_job = None
-                    if res["finish"]:
-                        fin = iv.call("finish_candidate", {"jobId": job["id"], "candidate": 1, **res["finish"]}, timeout=180)
-                        final_job = _wait_job(iv, fin["id"], "The finish")
-                        out = next((o for o in final_job.get("outputs", []) if o.get("kind") == "final"), None) or (final_job.get("outputs") or [out])[0]
-                    if not out:
-                        return fail("IV Studio finished but returned no video.")
-                    video = _fetch_output(out, _data_dir(), "iv-studio")
-                    try:
-                        from agent.video_gen_provider import save_bytes_video
-                        video = str(save_bytes_video(Path(video).read_bytes(), prefix="iv-studio", extension=Path(video).suffix.lstrip(".") or "mp4"))
-                    except Exception:
-                        pass
-                    resolved = (final_job or job).get("plan", {}).get("resolved", {}) or job.get("plan", {}).get("resolved", {})
+                    st = {"take": job["id"], "finish": res["finish"], "started": time.time(), "prompt": prompt,
+                          "h3_prompt": text, "prompt_writer": wrote, "character": c.get("name") if c else None,
+                          "seed": seed, "aspect": aspect, "seconds": seconds, "modality": "image" if image_url else "text"}
+                    _save_state(st)
+                    st = _advance(iv, st, _wait_budget() - (time.monotonic() - started))
             except IVStudioError as e:
                 return fail(str(e), "missing_dependency" if "isn't installed" in str(e) else "provider_error")
             except Exception as e:  # never take Hermes down with a render
                 logger.debug("iv-studio video failed", exc_info=True)
                 return fail(f"IV Studio: {e}")
+            if st.get("status") == "failed":
+                return fail(st.get("error") or "The render failed in IV Studio.")
+            if st.get("status") != "done":
+                return fail(_still_rendering(st), "still_rendering")
             return success_response(
-                video=video, model=model, prompt=prompt, modality="image" if image_url else "text",
-                aspect_ratio=aspect, duration=seconds, provider=NAME,
-                extra={
-                    "character": c.get("name") if c else None,
-                    "h3_prompt": text,
-                    "prompt_writer": wrote,
-                    "seed": resolved.get("seeds", [seed])[0] if isinstance(resolved.get("seeds"), list) else seed,
-                    "upscaled": bool(res["finish"] and res["finish"].get("upscale2x")),
-                    "finished": bool(res["finish"]),
-                    "iv_studio_project": job.get("projectId"),
-                    "render_seconds": round(time.monotonic() - started),
-                    "cost": "free (local GPU)",
-                },
+                video=st["video"], model=model, prompt=prompt, modality=st["modality"],
+                aspect_ratio=aspect, duration=seconds, provider=NAME, extra=_extra(st),
             )
 
     return IVStudioVideo
@@ -428,6 +498,57 @@ def _status_tool(args: dict, **kwargs: Any) -> str:
         return json.dumps({"installed": find_command(_exe_override()) is not None, "ready": False, "error": str(e)})
 
 
+def _extra(st: dict[str, Any]) -> dict[str, Any]:
+    fin = st.get("finish") or {}
+    return {
+        "character": st.get("character"),
+        "h3_prompt": st.get("h3_prompt"),
+        "prompt_writer": st.get("prompt_writer"),
+        "seed": st.get("seed"),
+        "finished": bool(fin),
+        "upscaled": bool(fin.get("upscale2x")),
+        "iv_studio_job": st.get("take"),
+        "iv_studio_project": st.get("project"),
+        "render_seconds": st.get("render_seconds"),
+        "cost": "free (local GPU)",
+    }
+
+
+RESULT_SCHEMA = {
+    "name": "iv_studio_result",
+    "description": (
+        "Wait for a video that IV Studio is still rendering on this PC and get it. video_generate hands back a job_id "
+        "instead of the video when a render outlasts one tool call (finished videos take about 3-7 minutes); call this "
+        "with that job_id, again if it says it's still rendering, until it returns the video path."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"job_id": {"type": "string", "description": "The IV Studio job id from video_generate"}},
+        "required": ["job_id"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _result_tool(args: dict, **kwargs: Any) -> str:
+    job_id = str((args or {}).get("job_id") or "").strip()
+    st = _load_state(job_id) if job_id else None
+    if not st:
+        return json.dumps({"success": False, "error": "No IV Studio render with job_id %r was started from Hermes." % job_id})
+    try:
+        if st.get("status") not in ("done", "failed"):
+            with IVStudio(_exe_override()) as iv:
+                st = _advance(iv, st, _wait_budget())
+    except Exception as e:
+        return json.dumps({"success": False, "error": "IV Studio: %s" % e})
+    if st.get("status") == "done":
+        return json.dumps({"success": True, "video": st["video"], "prompt": st.get("prompt"), "duration": st.get("seconds"),
+                           "aspect_ratio": st.get("aspect"), "provider": NAME, **_extra(st)})
+    if st.get("status") == "failed":
+        return json.dumps({"success": False, "error": st.get("error")})
+    return json.dumps({"success": False, "still_rendering": True, "job_id": st["take"], "message": _still_rendering(st)})
+
+
 def register(ctx) -> None:
     """Hermes plugin entry point."""
     global _CTX
@@ -435,6 +556,10 @@ def register(ctx) -> None:
     ctx.register_tool(
         name="iv_studio_status", toolset="iv_studio", schema=STATUS_SCHEMA, handler=_status_tool,
         description=STATUS_SCHEMA["description"], emoji="🎬",
+    )
+    ctx.register_tool(
+        name="iv_studio_result", toolset="iv_studio", schema=RESULT_SCHEMA, handler=_result_tool,
+        description=RESULT_SCHEMA["description"], emoji="🎬",
     )
     try:
         ctx.register_video_gen_provider(_video_provider_class()())

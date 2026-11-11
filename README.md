@@ -26,6 +26,9 @@ hermes: [video_generate → IV Studio on your RTX GPU, about 3 minutes]
   about 1376x768 with DLSS 5, and 1080p finishes and upscales 2x to about 2752x1536.
 - **`image_generate` on your GPU.** The first picture model IV Studio has ready (Z-Image Turbo, Krea 2, Flux 3 Klein,
   Qwen Image 2.1, Flux.2 Klein, SDXL or Moss); with `image_url` it edits that picture.
+- **Long renders don't break the turn.** Hermes stops any one tool call after 420 s, and a finished video can take
+  3 to 7 minutes. When a render outlasts the wait, `video_generate` hands back a job id and the render keeps going;
+  **`iv_studio_result`** picks it up again and returns the video. The state is saved, so it survives a restart.
 - **`iv_studio_status`.** A tool that tells Hermes whether IV Studio, ComfyUI and the GPU are ready, which characters
   exist and what's missing.
 - **A bundled skill** (`iv-studio:iv-studio-video`) on writing good requests for it.
@@ -50,7 +53,8 @@ hermes config set image_gen.provider iv-studio   # optional: pictures too
 ```
 
 Or pick **IV Studio (your GPU, free)** under `hermes tools` → Video Generation. If IV Studio is installed somewhere
-unusual (a portable copy), set the plugin's `ivstudio_path` setting to its executable.
+unusual (a portable copy), set the plugin's `ivstudio_path` setting to its executable. `wait_seconds` (default 330)
+is how long `video_generate` waits before handing back a job id; keep it under Hermes's tool timeout.
 
 ## How it works
 
@@ -58,7 +62,8 @@ IV Studio ships an MCP server inside its app. For each request the plugin finds 
 (`C:\Program Files\IV Studio`, `%LOCALAPPDATA%\Programs\IV Studio`, `/Applications/IV Studio.app`, or the
 AppImage's starter script), starts that server as a child process for the length of the request, and talks to it
 over stdio: it picks the character, has the prompt written, starts one take with `generate_previews`, waits for it,
-finishes it with `finish_candidate`, and copies the result into Hermes's media cache. The GPU work happens in your
+finishes it with `finish_candidate`, and copies the result into Hermes's media cache. Each render's progress is
+saved under `HERMES_HOME/plugin-data/iv-studio/renders`, so `iv_studio_result` can carry on where a call stopped. The GPU work happens in your
 own ComfyUI, exactly as when you click Hunt in IV Studio's window.
 
 ## Disclosure
@@ -68,7 +73,8 @@ own ComfyUI, exactly as when you click Hunt in IV Studio's window.
 - **Network:** none of its own. It reads finished files from your local ComfyUI (`127.0.0.1`), and downloads a
   picture only when you pass an `http(s)` URL as `image_url` or a reference. IV Studio's prompt writer uses whatever
   writer you picked in IV Studio's Settings (a local model, or Claude Code / Codex on their own logins).
-- **Files:** pictures you pass by URL are saved under `HERMES_HOME/plugin-data/iv-studio/inputs`; finished videos are
+- **Files:** pictures you pass by URL are saved under `HERMES_HOME/plugin-data/iv-studio/inputs` and each render's
+  progress under `renders/`; finished videos are
   copied into Hermes's media cache. Renders also stay in IV Studio's Library and ComfyUI's output folder.
 - **Credentials:** none. No API keys, no telemetry, no self-update.
 - **Terms:** MiniMax H3 runs under the MiniMax H3 Community License; IV Studio asks you to agree to its terms once

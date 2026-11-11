@@ -31,6 +31,12 @@ https://github.com/hollisorg/iv-studio/releases/latest and stop.
 - **Pictures as references:** `reference_image_urls` (up to 6) puts those people or places into a new scene.
 - **Same result again:** pass the `seed` the last result reported.
 
+## Long renders
+
+A finished video can take 3 to 7 minutes, longer than one tool call may run. If `video_generate` answers
+`still_rendering` with a job id, the render is still going: tell the person it's on its way, then call
+`iv_studio_result` with that job id (again if it's still rendering) until it returns the video.
+
 ## After the render
 
 The result has the local video path, the H3 prompt IV Studio actually rendered (`h3_prompt`), the `seed`, the
